@@ -18,6 +18,7 @@
     "test": "jest"
   },
   "dependencies": {
+    "fp-ts": "^2.11.1",
     "probot": "^11.0.1"
   },
   "devDependencies": {

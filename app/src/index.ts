@@ -3,6 +3,8 @@ import {EventPayloads, WebhookEvent} from "@octokit/webhooks";
 import {RestEndpointMethodTypes} from "@octokit/plugin-rest-endpoint-methods/dist-types/generated/parameters-and-response-types";
 import {Endpoints, RequestParameters} from "@octokit/types";
 import {components} from "@octokit/openapi-types";
+import {pipe} from "fp-ts/function";
+import {array} from "fp-ts";
 
 // const createScheduler = require("probot-scheduler")
 
@@ -57,6 +59,7 @@ type GitFileContents =
 
 type RawGitFileContents =
     | components["schemas"]["content-directory"]
+    | components["schemas"]["content-directory"][0]
     | components["schemas"]["content-file"]
     | components["schemas"]["content-symlink"]
     | components["schemas"]["content-submodule"]
@@ -70,7 +73,6 @@ function parseGitFileContents(data: RawGitFileContents): GitFileContents | undef
                 _type: "directory",
                 data,
                 files: data
-                    // @ts-ignore
                     .map(c => parseGitFileContents(c))
                     .filter(c => !!c)
             }
@@ -328,16 +330,22 @@ export = (app: Probot) => {
             return;
         }
 
-        const config = await context.config<Config>("sporkfed.yml", {version: "1", rules: []});
+        const config: Config | null = await context.config<Config>("sporkfed.yml", {version: "1", rules: []});
         if (!config) {
+            context.log.info({
+                tag: "ignore_no_config",
+                message: "Repo does not contain config",
+                ref: context.payload.ref,
+                after_commit_id: context.payload.after,
+            });
             return;
         }
 
-        // app.log.info({config});
-
-        for (const rule of config.rules) {
-            await handleRule(context, rule)
-        }
+        await pipe(
+            config.rules,
+            array.map(rule => handleRule(context, rule)),
+            (result) => Promise.all(result),
+        );
     });
 
     // leaving commented out so it's easy to reference during development of new hooks
