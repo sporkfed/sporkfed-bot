@@ -29,35 +29,106 @@ type ConfigV1 = {
 type Config =
     | ConfigV1
 
-type FileContents =
+
+type GitFileContentFile = {
+    _type: "file",
+    data: components["schemas"]["content-file"]
+}
+type GitFileContentSymlink = {
+    _type: "symlink",
+    data: components["schemas"]["content-symlink"]
+}
+type GitFileContentSubmodule = {
+    _type: "submodule",
+    data: components["schemas"]["content-submodule"]
+}
+type GitFileContentDirectory = {
+    _type: "directory",
+    files: Array<GitFileContentFile | GitFileContentSymlink | GitFileContentSubmodule>
+    data: components["schemas"]["content-directory"]
+};
+
+type GitFileContents =
+    | GitFileContentFile
+    | GitFileContentSymlink
+    | GitFileContentSubmodule
+    | GitFileContentDirectory
+
+
+type RawGitFileContents =
     | components["schemas"]["content-directory"]
     | components["schemas"]["content-file"]
     | components["schemas"]["content-symlink"]
     | components["schemas"]["content-submodule"]
 
+
+function parseGitFileContents(data: RawGitFileContents): GitFileContents | undefined {
+    if (Array.isArray(data)) {
+        const directoryData: components["schemas"]["content-directory"][0] | undefined = data.find(c => c.type === "dir");
+        if (directoryData) {
+            return <GitFileContentDirectory>{
+                _type: "directory",
+                data,
+                files: data
+                    // @ts-ignore
+                    .map(c => parseGitFileContents(c))
+                    .filter(c => !!c)
+            }
+        }
+        return undefined;
+    }
+
+    switch (data.type) {
+        case "file":
+            return {
+                _type: "file",
+                data: data
+            } as GitFileContentFile;
+        case "symlink":
+            return <GitFileContentSymlink>{
+                _type: "symlink",
+                data: data
+            };
+        case "submodule":
+            return <GitFileContentSubmodule>{
+                _type: "submodule",
+                data: data
+            };
+        default:
+            return undefined;
+    }
+}
+
 async function fetchFileContents(
     target: string,
     context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>,
     repo: RequestParameters & Omit<Endpoints["GET /repos/{owner}/{repo}/contents/{path}"]["parameters"], "baseUrl" | "headers" | "mediaType">,
-): Promise<FileContents | undefined> {
+): Promise<GitFileContents | undefined> {
     try {
-        const fileContents = await context.octokit.repos.getContent(repo);
+        const fileContentsResults = await context.octokit.repos.getContent(repo);
+        const data = fileContentsResults.data;
         context.log.info({
             tag: "fetch_file_contents_success",
             target,
-            fileContents: fileContents.data,
+            fileContents: data,
         });
 
-        return fileContents.data;
+        const contents = parseGitFileContents(data);
+        if (!contents) {
+            context.log.warn({
+                tag: "unknown_file_type",
+                data
+            })
+        }
+        return contents;
     } catch (e) {
         context.log.error({
             tag: "fetch_file_contents_error",
             target,
             err: e,
         });
+        return undefined;
     }
-
-    return undefined;
 }
 
 async function createBranch(
@@ -120,6 +191,120 @@ async function createPullRequest(
     });
 }
 
+async function handleRule(
+    context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>,
+    rule: ConfigRuleV1
+): Promise<void> {
+    const defaultBranch = context.payload.repository.default_branch;
+
+    const sourceFileContentResponse: GitFileContents | undefined = await fetchFileContents("source", context, {
+        owner: rule.upstream.repo.owner,
+        repo: rule.upstream.repo.name,
+        path: rule.upstream.path,
+        ref: rule.upstream.branch,
+    });
+
+    if (!sourceFileContentResponse) {
+        context.log.warn({tag: "source_path_not_found", message: `Source file was not found`, rule});
+        return;
+    }
+
+    switch (sourceFileContentResponse._type) {
+        case "file":
+            break;
+        case "symlink":
+            context.log.warn({
+                tag: "unsupported_source_type",
+                message: `Source file must be of 'file' type`,
+                rule,
+                type: sourceFileContentResponse._type,
+            });
+            return;
+        case "submodule":
+            context.log.warn({
+                tag: "unsupported_source_type",
+                message: `Source file must be of 'file' type`,
+                rule,
+                type: sourceFileContentResponse._type,
+            });
+            return;
+        case "directory":
+            context.log.warn({
+                tag: "unsupported_source_type",
+                message: `Source file must be of 'file' type`,
+                rule,
+                type: sourceFileContentResponse._type,
+            });
+            return;
+    }
+
+    const targetFileContentResponse: GitFileContents | undefined = await fetchFileContents("target", context, context.repo({
+        path: rule.target.path,
+        ref: rule.target.branch,
+    }));
+
+
+    switch (targetFileContentResponse?._type) {
+        case "file":
+            break;
+        case "symlink":
+            context.log.warn({
+                tag: "unsupported_target_type",
+                message: `Target file must be of 'file' type`,
+                rule,
+                type: targetFileContentResponse._type,
+            });
+            return;
+        case "submodule":
+            context.log.warn({
+                tag: "unsupported_target_type",
+                message: `Target file must be of 'file' type`,
+                rule,
+                type: targetFileContentResponse._type,
+            });
+            return;
+        case "directory":
+            context.log.warn({
+                tag: "unsupported_target_type",
+                message: `Target file must be of 'file' type`,
+                rule,
+                type: targetFileContentResponse._type,
+            });
+            return;
+    }
+
+    if (targetFileContentResponse && Array.isArray(targetFileContentResponse)) {
+        context.log.warn({tag: "unsupported_target_type", message: `Target file must be of 'file' type`, rule});
+        return;
+    }
+
+    const sourceFileSha = sourceFileContentResponse.data.sha;
+    const targetFileSha = targetFileContentResponse?.data.sha;
+
+    if (sourceFileSha === targetFileSha) {
+        context.log.info({tag: "ignore_no_changes", message: `Target is already up to date!`, rule});
+        return;
+    }
+
+    const sourceFileContent = sourceFileContentResponse.data.content;
+
+    const targetBranch = `sporkfed/${rule.target.path}`;
+    await createBranch(context, targetBranch, defaultBranch);
+
+    const message = `sporkfed[bot] ${targetFileSha ? "update" : "create"} file at '${rule.target.path}'`;
+
+    const updateFileContentsResult = await context.octokit.repos.createOrUpdateFileContents(context.repo({
+        path: rule.target.path,
+        message: message,
+        content: `${sourceFileContent}`,
+        sha: targetFileSha,
+        branch: targetBranch,
+    }));
+    context.log.info({tag: "update_target_content", updateFileContents: updateFileContentsResult.data});
+
+    await createPullRequest(context, message, targetBranch, defaultBranch);
+}
+
 export = (app: Probot) => {
     app.on("push", async (context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>) => {
         const defaultBranch = context.payload.repository.default_branch;
@@ -143,7 +328,7 @@ export = (app: Probot) => {
             return;
         }
 
-        const config = await context.config<Config>("sporkfed.yml");
+        const config = await context.config<Config>("sporkfed.yml", {version: "1", rules: []});
         if (!config) {
             return;
         }
@@ -151,68 +336,7 @@ export = (app: Probot) => {
         // app.log.info({config});
 
         for (const rule of config.rules) {
-            const sourceFileContentResponse: FileContents | undefined = await fetchFileContents("source", context, {
-                owner: rule.upstream.repo.owner,
-                repo: rule.upstream.repo.name,
-                path: rule.upstream.path,
-                ref: rule.upstream.branch,
-            });
-
-            if (!sourceFileContentResponse) {
-                context.log.warn({tag: "source_path_not_found", message: `Source file was not found`, rule});
-                break;
-            }
-
-            if (Array.isArray(sourceFileContentResponse)) {
-                context.log.warn({message: `Source file must be of 'file' type`, rule, type: `directory`});
-                break;
-            }
-
-            // @ts-ignore
-            const sourceFileContent = sourceFileContentResponse.content;
-            if (!sourceFileContent) {
-                context.log.warn({
-                    tag: "unsupported_source_type",
-                    message: `Source file must be of 'file' type`,
-                    rule,
-                    type: sourceFileContentResponse.type
-                });
-                break;
-            }
-
-            const targetFileContentResponse: FileContents | undefined = await fetchFileContents("target", context, context.repo({
-                path: rule.target.path,
-                ref: rule.target.branch,
-            }));
-
-            if (targetFileContentResponse && Array.isArray(targetFileContentResponse)) {
-                context.log.warn({tag: "unsupported_target_type", message: `Target file must be of 'file' type`, rule});
-                break;
-            }
-
-            const sourceFileSha = sourceFileContentResponse.sha;
-            const targetFileSha = targetFileContentResponse?.sha;
-
-            if (sourceFileSha === targetFileSha) {
-                context.log.info({tag: "ignore_no_changes", message: `Target is already up to date!`, rule});
-                break;
-            }
-
-            const targetBranch = `sporkfed/${rule.target.path}`;
-            await createBranch(context, targetBranch, defaultBranch);
-
-            const message = `sporkfed[bot] ${targetFileSha ? "update" : "create"} file at '${rule.target.path}'`;
-
-            const updateFileContentsResult = await context.octokit.repos.createOrUpdateFileContents(context.repo({
-                path: rule.target.path,
-                message: message,
-                content: `${sourceFileContent}`,
-                sha: targetFileSha,
-                branch: targetBranch,
-            }));
-            context.log.info({tag: "update_target_content", updateFileContents: updateFileContentsResult.data});
-
-            await createPullRequest(context, message, targetBranch, defaultBranch);
+            await handleRule(context, rule)
         }
     });
 
