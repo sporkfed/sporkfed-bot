@@ -1,10 +1,11 @@
 import {Context, Probot} from "probot";
-import {EventPayloads, WebhookEvent} from "@octokit/webhooks";
+import {EventPayloads} from "@octokit/webhooks";
 import {RestEndpointMethodTypes} from "@octokit/plugin-rest-endpoint-methods/dist-types/generated/parameters-and-response-types";
 import {Endpoints, RequestParameters} from "@octokit/types";
 import {components} from "@octokit/openapi-types";
 import {pipe} from "fp-ts/function";
 import {array} from "fp-ts";
+import {WebhookPayloadWithRepository} from "probot/lib/context";
 
 // const createScheduler = require("probot-scheduler")
 
@@ -33,21 +34,33 @@ type Config =
 
 
 type GitFileContentFile = {
-    _type: "file",
+    _type: "file"
     data: components["schemas"]["content-file"]
 }
 type GitFileContentSymlink = {
-    _type: "symlink",
+    _type: "symlink"
     data: components["schemas"]["content-symlink"]
 }
 type GitFileContentSubmodule = {
-    _type: "submodule",
+    _type: "submodule"
     data: components["schemas"]["content-submodule"]
 }
 type GitFileContentDirectory = {
-    _type: "directory",
+    _type: "directory"
     files: Array<GitFileContentFile | GitFileContentSymlink | GitFileContentSubmodule>
-    data: components["schemas"]["content-directory"]
+    path: string
+};
+type NullGitFileContent = {
+    _type: "null"
+    data: {
+        sha: undefined
+    }
+};
+const nullGitFileContent: NullGitFileContent = {
+    _type: "null",
+    data: {
+        sha: undefined
+    }
 };
 
 type GitFileContents =
@@ -55,6 +68,7 @@ type GitFileContents =
     | GitFileContentSymlink
     | GitFileContentSubmodule
     | GitFileContentDirectory
+    | NullGitFileContent
 
 
 type RawGitFileContents =
@@ -65,19 +79,15 @@ type RawGitFileContents =
     | components["schemas"]["content-submodule"]
 
 
-function parseGitFileContents(data: RawGitFileContents): GitFileContents | undefined {
+function parseGitFileContents(data: RawGitFileContents, path: string): GitFileContents {
     if (Array.isArray(data)) {
-        const directoryData: components["schemas"]["content-directory"][0] | undefined = data.find(c => c.type === "dir");
-        if (directoryData) {
-            return <GitFileContentDirectory>{
-                _type: "directory",
-                data,
-                files: data
-                    .map(c => parseGitFileContents(c))
-                    .filter(c => !!c)
-            }
+        return <GitFileContentDirectory>{
+            _type: "directory",
+            path,
+            files: data
+                .map(c => parseGitFileContents(c, c.path))
+                .filter(c => !!c)
         }
-        return undefined;
     }
 
     switch (data.type) {
@@ -97,15 +107,15 @@ function parseGitFileContents(data: RawGitFileContents): GitFileContents | undef
                 data: data
             };
         default:
-            return undefined;
+            return nullGitFileContent;
     }
 }
 
 async function fetchFileContents(
     target: string,
-    context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>,
+    context: Context<WebhookPayloadWithRepository>,
     repo: RequestParameters & Omit<Endpoints["GET /repos/{owner}/{repo}/contents/{path}"]["parameters"], "baseUrl" | "headers" | "mediaType">,
-): Promise<GitFileContents | undefined> {
+): Promise<GitFileContents> {
     try {
         const fileContentsResults = await context.octokit.repos.getContent(repo);
         const data = fileContentsResults.data;
@@ -115,7 +125,7 @@ async function fetchFileContents(
             fileContents: data,
         });
 
-        const contents = parseGitFileContents(data);
+        const contents = parseGitFileContents(data, repo.path);
         if (!contents) {
             context.log.warn({
                 tag: "unknown_file_type",
@@ -129,12 +139,12 @@ async function fetchFileContents(
             target,
             err: e,
         });
-        return undefined;
+        return nullGitFileContent;
     }
 }
 
 async function createBranch(
-    context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>,
+    context: Context<WebhookPayloadWithRepository>,
     targetBranch: string,
     defaultBranch: string,
 ) {
@@ -163,142 +173,72 @@ async function createBranch(
             tag: "create_branch_error",
             err: e,
         });
+        throw e;
     }
 }
 
 async function createPullRequest(
-    context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>,
+    context: Context<WebhookPayloadWithRepository>,
     message: string,
     targetBranch: string,
     defaultBranch: string,
 ) {
-    // const openPullRequests = await context.octokit.pulls.list(context.repo({
-    //     state: "open",
-    //     base: defaultBranch,
-    //     head: targetBranch,
-    // }));
-    // context.log.info({
-    //     tag: "create_branch_error",
-    //     openPullRequests,
-    // });
+    try {
+        const openPullRequests: RestEndpointMethodTypes["pulls"]["list"]["response"] = await context.octokit.pulls.list(context.repo({
+            state: "open",
+            base: defaultBranch,
+            head: targetBranch,
+        }));
 
-    const createPullRequestResult = await context.octokit.pulls.create(context.repo({
-        title: message,
-        base: defaultBranch,
-        head: targetBranch,
-    }));
-    context.log.info({
-        tag: "create_pull_request_error",
-        createPullRequestResult,
-    });
+        context.log.error({
+            tag: "open_pull_requests_error",
+            openPRs: openPullRequests.data,
+        });
+    } catch (e) {
+        context.log.error({
+            tag: "list_open_pull_requests_error",
+            err: e,
+        });
+    }
+
+    try {
+        await context.octokit.pulls.create(context.repo({
+            title: message,
+            base: defaultBranch,
+            head: targetBranch,
+        }));
+    } catch (e) {
+        context.log.error({
+            tag: "create_pull_request_error",
+            err: e,
+        });
+    }
 }
 
-async function handleRule(
-    context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>,
-    rule: ConfigRuleV1
+async function updateFileContentsPR(
+    context: Context<WebhookPayloadWithRepository>,
+    defaultBranch: string,
+    sourceFileContent: GitFileContentFile,
+    targetFilePath: string,
+    targetFileContent: GitFileContentFile | GitFileContentSymlink | GitFileContentSubmodule | NullGitFileContent,
 ): Promise<void> {
-    const defaultBranch = context.payload.repository.default_branch;
-
-    const sourceFileContentResponse: GitFileContents | undefined = await fetchFileContents("source", context, {
-        owner: rule.upstream.repo.owner,
-        repo: rule.upstream.repo.name,
-        path: rule.upstream.path,
-        ref: rule.upstream.branch,
-    });
-
-    if (!sourceFileContentResponse) {
-        context.log.warn({tag: "source_path_not_found", message: `Source file was not found`, rule});
-        return;
-    }
-
-    switch (sourceFileContentResponse._type) {
-        case "file":
-            break;
-        case "symlink":
-            context.log.warn({
-                tag: "unsupported_source_type",
-                message: `Source file must be of 'file' type`,
-                rule,
-                type: sourceFileContentResponse._type,
-            });
-            return;
-        case "submodule":
-            context.log.warn({
-                tag: "unsupported_source_type",
-                message: `Source file must be of 'file' type`,
-                rule,
-                type: sourceFileContentResponse._type,
-            });
-            return;
-        case "directory":
-            context.log.warn({
-                tag: "unsupported_source_type",
-                message: `Source file must be of 'file' type`,
-                rule,
-                type: sourceFileContentResponse._type,
-            });
-            return;
-    }
-
-    const targetFileContentResponse: GitFileContents | undefined = await fetchFileContents("target", context, context.repo({
-        path: rule.target.path,
-        ref: rule.target.branch,
-    }));
-
-
-    switch (targetFileContentResponse?._type) {
-        case "file":
-            break;
-        case "symlink":
-            context.log.warn({
-                tag: "unsupported_target_type",
-                message: `Target file must be of 'file' type`,
-                rule,
-                type: targetFileContentResponse._type,
-            });
-            return;
-        case "submodule":
-            context.log.warn({
-                tag: "unsupported_target_type",
-                message: `Target file must be of 'file' type`,
-                rule,
-                type: targetFileContentResponse._type,
-            });
-            return;
-        case "directory":
-            context.log.warn({
-                tag: "unsupported_target_type",
-                message: `Target file must be of 'file' type`,
-                rule,
-                type: targetFileContentResponse._type,
-            });
-            return;
-    }
-
-    if (targetFileContentResponse && Array.isArray(targetFileContentResponse)) {
-        context.log.warn({tag: "unsupported_target_type", message: `Target file must be of 'file' type`, rule});
-        return;
-    }
-
-    const sourceFileSha = sourceFileContentResponse.data.sha;
-    const targetFileSha = targetFileContentResponse?.data.sha;
+    const sourceFileSha = sourceFileContent.data.sha;
+    const targetFileSha = targetFileContent.data.sha;
 
     if (sourceFileSha === targetFileSha) {
-        context.log.info({tag: "ignore_no_changes", message: `Target is already up to date!`, rule});
+        context.log.info({tag: "ignore_no_changes", message: `Target is already up to date!`, targetFilePath});
         return;
     }
 
-    const sourceFileContent = sourceFileContentResponse.data.content;
+    const targetBranch = `sporkfed/${targetFilePath}`;
+    const message = `sporkfed[bot] ${targetFileSha ? "update" : "create"} file at '${targetFilePath}'`;
 
-    const targetBranch = `sporkfed/${rule.target.path}`;
     await createBranch(context, targetBranch, defaultBranch);
 
-    const message = `sporkfed[bot] ${targetFileSha ? "update" : "create"} file at '${rule.target.path}'`;
-
     const updateFileContentsResult = await context.octokit.repos.createOrUpdateFileContents(context.repo({
-        path: rule.target.path,
+        path: targetFilePath,
         message: message,
-        content: `${sourceFileContent}`,
+        content: `${sourceFileContent.data.content}`,
         sha: targetFileSha,
         branch: targetBranch,
     }));
@@ -307,8 +247,90 @@ async function handleRule(
     await createPullRequest(context, message, targetBranch, defaultBranch);
 }
 
+async function handleRule(
+    context: Context<EventPayloads.WebhookPayloadPush>,
+    rule: ConfigRuleV1
+): Promise<void> {
+    const defaultBranch = context.payload.repository.default_branch;
+
+    const sourceFileContent: GitFileContents = await fetchFileContents("source", context, {
+        owner: rule.upstream.repo.owner,
+        repo: rule.upstream.repo.name,
+        path: rule.upstream.path,
+        ref: rule.upstream.branch,
+    });
+
+    const targetFileContent: GitFileContents = await fetchFileContents("target", context, context.repo({
+        path: rule.target.path,
+        ref: rule.target.branch,
+    }));
+
+    switch (sourceFileContent._type) {
+        case "null":
+            context.log.warn({tag: "source_path_not_found", message: `Source file was not found`, rule});
+            return;
+        case "file":
+            switch (targetFileContent._type) {
+                case "null":
+                case "file":
+                    const targetFilePath = rule.target.path;
+                    await updateFileContentsPR(context, defaultBranch, sourceFileContent, targetFilePath, targetFileContent);
+                    return;
+                case "symlink":
+                    context.log.warn({
+                        tag: "unsupported_target_type",
+                        message: `Target file must be of 'file' type`,
+                        rule,
+                        target: targetFileContent,
+                    });
+                    return;
+                case "submodule":
+                    context.log.warn({
+                        tag: "unsupported_target_type",
+                        message: `Target file must be of 'file' type`,
+                        rule,
+                        target: targetFileContent,
+                    });
+                    return;
+                case "directory":
+                    const actualTargetFilePath = `${rule.target.path}/${sourceFileContent.data.name}`;
+                    const actualTargetFileContent: GitFileContentFile | GitFileContentSymlink | GitFileContentSubmodule | NullGitFileContent
+                        = targetFileContent.files.find(file => file.data.path === actualTargetFilePath) ?? nullGitFileContent;
+
+                    await updateFileContentsPR(context, defaultBranch, sourceFileContent, actualTargetFilePath, actualTargetFileContent);
+
+                    return;
+            }
+            return;
+        case "symlink":
+            context.log.warn({
+                tag: "unsupported_source_type",
+                message: `Source file must be of 'file' type`,
+                rule,
+                source: sourceFileContent,
+            });
+            return;
+        case "submodule":
+            context.log.warn({
+                tag: "unsupported_source_type",
+                message: `Source file must be of 'file' type`,
+                rule,
+                source: sourceFileContent,
+            });
+            return;
+        case "directory":
+            context.log.warn({
+                tag: "unsupported_source_type",
+                message: `Source file must be of 'file' type`,
+                rule,
+                source: sourceFileContent,
+            });
+            return;
+    }
+}
+
 export = (app: Probot) => {
-    app.on("push", async (context: WebhookEvent<EventPayloads.WebhookPayloadPush> & Omit<Context, keyof WebhookEvent>) => {
+    app.on("push", async (context: Context<EventPayloads.WebhookPayloadPush>) => {
         const defaultBranch = context.payload.repository.default_branch;
         if (context.payload.ref !== `refs/heads/${defaultBranch}`) {
             context.log.info({
