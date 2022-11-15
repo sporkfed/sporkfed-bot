@@ -1,0 +1,12 @@
+version: "3"
+services:
+  sporkfed-bot:
+    build:
+      target: local-runtime
+      context: ./app
+      dockerfile: ./Dockerfile
+    volumes:
+      - ./certs/sporkfed.private-key.pem:/app/sporkfed.private-key.pem:ro
+      - ./app/.env:/app/.env:rw
+    ports:
+      - 3000:3000
